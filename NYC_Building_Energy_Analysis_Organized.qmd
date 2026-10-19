@@ -1,0 +1,1463 @@
+
+---
+title: "NYC Building Energy Performance & Data Quality Analysis"
+author: "Ella Ashburn"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    toc-expand: true
+    number-sections: true
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+# Introduction
+
+New York City’s building energy benchmarking disclosures provide an opportunity to examine reported energy intensity across different property types and years. Before drawing conclusions from these records, however, the data must be checked for repeated submissions, missing measurements, and unusually large values.
+
+This project investigates the question: **How does energy performance vary across NYC buildings, and what data-quality issues could affect the reliability of energy-efficiency assessments?** It uses SQL through SQLite for data inspection and cleaning, and R for statistical summaries and visualization. The analysis covers calendar years **2022–2024** and focuses on **Site Energy Use Intensity (Site EUI)**, measured in kBtu per square foot.
+
+The workflow begins with validation of the raw data, builds a reproducible cleaned table, explores annual and property-type patterns, and finishes with a matched-building comparison that follows the same properties over time. Site EUI is an intensity measure, not a direct test of why a building’s energy consumption changed.
+
+**Data source:** NYC Building Energy and Water Data Disclosure for Local Law 84 (calendar years 2022–2024).
+
+## Reproducibility and file paths
+
+The original analysis used a local CSV in the Downloads folder and a SQLite file named `nyc_building_energy.sqlite`. Before rendering on another computer, update the CSV path in the import chunks. The document recreates the SQLite tables as it runs.
+
+
+## Data import and initial validation
+
+The original file contains 103,259 records and 265 columns. 
+
+```{r}
+#| label: analysis-01
+#| include: false
+# Import the raw CSV to inspect parsing warnings.
+library(readr)
+
+building_data <- read_csv(
+  "/Users/beepbop/Downloads/NYC_Building_Energy_and_Water_Data_Disclosure_for_Local_Law_84_2023_to_Present_(Data_for_Calendar_Year_2022-Present)_20261012.csv"
+)
+```
+
+```{r}
+#| label: analysis-02
+#| include: false
+# Inspect the original CSV parsing problems.
+problems(building_data)
+```
+
+```{r}
+#| label: analysis-03
+#| include: false
+# Identify the two affected meter-count columns.
+names(building_data)[250:251]
+# Two meter-count columns contained values formatted with thousands separators. Reimporting those columns as text and applying `parse_number()` resolved the four reported parsing issues.
+```
+
+
+```{r}
+#| label: analysis-04
+#| include: false
+# Read meter counts as text, then convert comma-formatted numbers.
+building_data <- read_csv(
+  "/Users/beepbop/Downloads/NYC_Building_Energy_and_Water_Data_Disclosure_for_Local_Law_84_2023_to_Present_(Data_for_Calendar_Year_2022-Present)_20261012.csv",
+  col_types = cols(
+    `Number of Active Energy Meters - Total` = col_character(),
+    `Number of Active Energy Meters - Used to Compute Metrics` = col_character(),
+    .default = col_guess()
+  )
+)
+ # parse_number() coverst va;uses into numbers
+building_data$`Number of Active Energy Meters - Total` <-
+  parse_number(building_data$`Number of Active Energy Meters - Total`) 
+
+building_data$`Number of Active Energy Meters - Used to Compute Metrics` <-
+  parse_number(building_data$`Number of Active Energy Meters - Used to Compute Metrics`)
+
+problems(building_data)
+```
+
+After fixing the parsing issues our NYC building energy data set now contains 103,259 rows and 265 columns.
+
+```{r}
+#| label: analysis-05
+#| echo: false
+# Count raw records for each reporting year.
+# table() counts how many records belong to each year 
+table(building_data$`Calendar Year`, useNA = "ifany")
+# Returns the year asscoicated with each buildings reported energy data and the amount of records that belong to each year
+```
+
+The first step in checking duplicates was to identify a consistent property identifier.
+
+## Identifying properties and duplicate records
+
+```{r}
+#| label: analysis-06
+#| include: false
+# Find candidate property identifiers.
+names(building_data) [
+  grepl("Property ID|Building ID|BBL|BIN",
+        names(building_data),
+        ignore.case = TRUE)
+]
+```
+
+I checked whether each property ID appeared only once in a reporting year.
+
+A property should normally contribute one observation per calendar year to a property-level annual comparison. The following checks identify repeated property-year combinations.
+
+```{r}
+#| label: analysis-07
+#| include: false
+# Identify property-year pairs with repeated submissions.
+library(dplyr)
+building_data %>%
+  count(`Calendar Year`, `Property ID`) %>%
+  filter(n>1)
+```
+
+The next query counts how many property-year groups have repeated submissions.
+
+The duplicate-frequency table distinguishes groups with two, three, or four submissions.
+
+```{r}
+#| label: analysis-08
+#| echo: false
+# Count how many submissions occur per repeated property-year group.
+building_data %>%
+  count(`Calendar Year`, `Property ID`) %>%
+  filter(n > 1) %>%
+  count(`Calendar Year`, n)
+```
+
+I next checked whether the repeated submissions were identical across all columns.
+
+There were no rows that were identical across every column. Repeated property-year submissions may contain equivalent energy values.
+
+```{r}
+#| label: analysis-09
+#| include: false
+# Count completely identical rows.
+sum(duplicated(building_data))
+```
+
+There are no completely identical rows in the original dataset.
+
+```{r}
+#| label: analysis-10
+#| include: false
+# Inspect a repeated property-year example.
+building_data[
+  building_data$`Property ID` == 1069082 &
+  building_data$`Calendar Year` == 2022,
+  c(
+    "Property ID",
+    "Calendar Year",
+    "Property Name",
+    "Primary Property Type - Self Selected",
+    "Property GFA - Self-Reported (ft²)"
+  )
+]
+```
+
+To understand the duplicates, I compared the fields in two submissions for the same property and year.
+
+For one example property, `vapply()` compares the first two records separately for every column and returns the names of fields that differ.
+
+```{r}
+#| label: analysis-11
+#| include: false
+# Find columns that differ between two submissions.
+property_records <- building_data[
+  building_data$`Property ID` == 1069082 &
+  building_data$`Calendar Year` == 2022,
+]
+
+different_columns <- names(property_records)[
+  vapply(property_records, function(x) {
+    !identical(x[1], x[2]) #check to see if first column in not identical to the second column 
+  }, logical(1)) # Each Comparison returs TRUE or FALSE
+]
+
+different_columns
+```
+
+For this example, only the report generation and submission timestamps differed.
+
+```{r}
+#| label: analysis-12
+#| echo: false
+# Display the timestamps that differ.
+property_records[
+  ,
+  c(
+    "Property ID",
+    "Calendar Year",
+    "Report Generation Date",
+    "Report Submission Date"
+  )
+]
+```
+
+```{r}
+#| label: analysis-13
+#| include: false
+# Repeat the comparison for a second property.
+property_records_2 <- building_data[
+  building_data$`Property ID` == 1200524 &
+  building_data$`Calendar Year` == 2022,
+]
+
+names(property_records_2)[
+  vapply(property_records_2, function(x) {
+    !identical(x[1], x[2])
+  }, logical(1))
+]
+```
+
+The second example also differed only in the reporting timestamps.
+
+These examples prompted a broader check for conflicting energy measurements among repeated submissions.
+
+## SQL database and duplicate-resolution methodology
+
+SQLite was used to inspect submissions and perform deduplication while preserving the full original dataset.
+
+```{r}
+#| label: analysis-14
+#| include: false
+# Connect to the SQLite database.
+library(DBI)
+library(RSQLite)
+con <- dbConnect(
+  SQLite(),
+  dbname = "nyc_building_energy.sqlite"
+)
+dbIsValid(con)
+```
+
+```{r}
+#| label: analysis-15
+#| include: false
+# Copy the original records into SQLite.
+dbWriteTable(
+  con,
+  "buildings",
+  building_data,
+  overwrite = TRUE
+)
+# Creates table "buildings" and copies R data frame into it
+dbListTables(con)
+```
+
+Verify all records were transferred correctly
+
+```{r}
+#| label: analysis-16
+#| echo: false
+# Verify the total imported row count.
+dbGetQuery(con, "
+  SELECT COUNT(*) AS total_records
+  FROM buildings;
+")
+```
+
+Check the number of records by year, to understand distribution
+
+```{r}
+#| label: analysis-17
+#| echo: false
+# Count records by calendar year in SQLite.
+dbGetQuery(con, '
+  SELECT
+    "Calendar Year",
+    COUNT(*) AS total_buildings
+  FROM buildings
+  GROUP BY "Calendar Year"
+  ORDER BY "Calendar Year";
+')
+```
+
+```{r}
+#| label: analysis-18
+#| include: false
+# Preview repeated property-year groups.
+dbGetQuery(con, '
+  SELECT
+    "Calendar Year",
+    "Property ID",
+    COUNT(*) AS record_count
+  FROM buildings
+  GROUP BY "Calendar Year", "Property ID"
+  HAVING COUNT(*) > 1
+  ORDER BY "Calendar Year", record_count DESC
+  LIMIT 10;
+')
+```
+
+Count repeated property-year combinations
+
+This query counts **repeated property-year groups**, rather than the number of additional rows. In the original data there were 153 such groups in 2022 and 618 in 2023.
+
+```{r}
+#| label: analysis-19
+#| echo: false
+# Count groups with multiple submissions by year.
+dbGetQuery(con, '
+  SELECT
+    "Calendar Year",
+    COUNT(*) AS repeated_properties
+  FROM (
+    SELECT
+      "Calendar Year",
+      "Property ID"
+    FROM buildings
+    GROUP BY "Calendar Year", "Property ID"
+    HAVING COUNT(*) > 1
+  ) AS duplicates
+  GROUP BY "Calendar Year"
+  ORDER BY "Calendar Year";
+')
+```
+
+Repeated submissions could give some properties too much weight in annual summaries if each row were counted separately.
+
+Before deduplicating, I checked whether reported EUI values changed across submissions.
+
+A separate calculation counts **extra rows beyond the first submission**: 153 in 2022 and 622 in 2023, or 775 rows in total. The distinction matters because a few groups contain more than two submissions.
+
+```{r}
+#| label: analysis-20
+#| echo: false
+# Count additional rows beyond one submission per property-year.
+dbGetQuery(con, '
+  SELECT 
+    "Calendar Year",
+    SUM(record_count -1) AS extra_records 
+  FROM(
+    SELECT 
+    "Calendar Year",
+    "Property ID",
+    COUNT(*) AS record_count
+  FROM buildings
+  GROUP BY "Calendar Year", "Property ID"
+  HAVING COUNT(*) >1
+  ) AS duplicates
+  GROUP BY "Calendar Year"
+  ORDER BY "Calendar Year";
+')
+#SUM(record_count -1) Calcualtes how many additional rows exist beyond the first record
+```
+
+The next query checks for distinct EUI values within repeated property-year groups.
+
+`COUNT(DISTINCT ...)` checks whether repeated submissions contain different Site EUI values. Some property-year groups did, so selecting an observation required a documented rule.
+
+```{r}
+#| label: analysis-21
+#| echo: false
+# Check whether repeated submissions disagree on EUI.
+dbGetQuery(con, '
+  SELECT
+    "Calendar Year",
+    "Property ID",
+    COUNT(*) AS record_count,
+    COUNT(DISTINCT "Site EUI (kBtu/ft²)") AS distinct_eui_values 
+  FROM buildings
+  GROUP BY "Calendar Year", "Property ID"
+  HAVING COUNT(*) > 1
+  ORDER BY distinct_eui_values DESC, record_count DESC
+  LIMIT 10;
+')
+ #If distinct_eui_values greater than 1 the property has conflicting energy measurnments across records
+```
+
+Some properties reported different Site EUI values for the same calendar year.
+
+```{r}
+#| label: analysis-22
+#| echo: false
+# Inspect one property with conflicting EUI reports.
+dbGetQuery(con, '
+  SELECT
+    "Property ID",
+    "Calendar Year",
+    "Site EUI (kBtu/ft²)",
+    "Report Generation Date",
+    "Report Submission Date"
+  FROM buildings
+  WHERE "Property ID" = 5834470
+    AND "Calendar Year" = 2023
+  ORDER BY "Report Submission Date";
+')
+```
+
+```{r}
+#| label: analysis-23
+#| include: false
+# Check availability of submission dates.
+dbGetQuery(con, '
+  SELECT
+    COUNT(*) AS total_records,
+    SUM(
+      CASE
+        WHEN "Report Submission Date" IS NULL
+          OR TRIM("Report Submission Date") = ""
+        THEN 1
+        ELSE 0
+      END
+    ) AS missing_submission_dates
+  FROM buildings;
+')
+```
+
+```{r}
+#| label: analysis-24
+#| echo: false
+# Compare missing submission dates across years.
+dbGetQuery(con, '
+  SELECT
+    "Calendar Year",
+    COUNT(*) AS total_records,
+    SUM(
+      CASE
+        WHEN "Report Submission Date" IS NULL
+          OR TRIM("Report Submission Date") = ""
+        THEN 1
+        ELSE 0
+      END
+    ) AS missing_dates
+  FROM buildings
+  GROUP BY "Calendar Year"
+  ORDER BY "Calendar Year";
+')
+```
+
+Submission timestamps were available for the duplicated groups, supporting the use of the latest submission as the selection rule. report for each repeated property-year combination.
+
+The timestamp strings were converted to a format that sorts chronologically.
+
+Submission timestamps were converted from month/day/year and 12-hour clock notation into a sortable year-month-day and 24-hour format.
+
+```{r}
+#| label: analysis-25
+#| include: false
+# Convert submission dates to sortable timestamps.
+dbGetQuery(con, '
+  SELECT
+    "Report Submission Date" AS original_date,
+    substr("Report Submission Date", 7, 4) || "-" ||
+    substr("Report Submission Date", 1, 2) || "-" ||
+    substr("Report Submission Date", 4, 2) || " " ||
+    printf("%02d",
+      (CAST(substr("Report Submission Date", 12, 2) AS INTEGER) % 12) +
+      CASE
+        WHEN substr("Report Submission Date", -2) = "PM"
+        THEN 12
+        ELSE 0
+      END
+    ) ||
+    substr("Report Submission Date", 14, 6) AS formatted_timestamp
+  FROM buildings
+  WHERE "Property ID" = 5834470
+    AND "Calendar Year" = 2023
+  ORDER BY formatted_timestamp;
+')
+```
+
+I then ranked submissions by date within each property-year group.
+
+`ROW_NUMBER()` ranks submissions within each property-year group. `PARTITION BY` restarts the ranking for each property and year; descending timestamp order places the latest submission first.
+
+```{r}
+#| label: analysis-26
+#| include: false
+# Rank submissions by recency within a property-year.
+dbGetQuery(con, '
+  SELECT
+    "Property ID",
+    "Calendar Year",
+    "Report Submission Date",
+    ROW_NUMBER() OVER (
+      PARTITION BY "Property ID", "Calendar Year"
+      ORDER BY
+        substr("Report Submission Date", 7, 4) || "-" ||
+        substr("Report Submission Date", 1, 2) || "-" ||
+        substr("Report Submission Date", 4, 2) || " " ||
+        printf("%02d",
+          (CAST(substr("Report Submission Date", 12, 2) AS INTEGER) % 12) +
+          CASE
+            WHEN substr("Report Submission Date", -2) = "PM"
+            THEN 12
+            ELSE 0
+          END
+        ) ||
+        substr("Report Submission Date", 14, 6) DESC
+    ) AS submission_rank
+  FROM buildings
+  WHERE "Property ID" = 5834470
+    AND "Calendar Year" = 2023
+  ORDER BY submission_rank;
+')
+# used ROW_NUMBER() to rank records within each property-year combination
+```
+
+The ranked records were used to create a cleaned SQL table.
+
+The cleaned table retains one record per property-year combination, selecting the latest available submission. The original `buildings` table remains available for auditing. Re-running this chunk rebuilds `buildings_clean`.
+
+```{r}
+#| label: analysis-27
+#| include: false
+# Build a cleaned table using the latest submission.
+dbExecute(con, '
+  DROP TABLE IF EXISTS buildings_clean;
+')
+dbExecute(con, '
+  CREATE TABLE buildings_clean AS
+  WITH ranked AS (
+    SELECT
+      *,
+      ROW_NUMBER() OVER (
+        PARTITION BY "Property ID", "Calendar Year"
+        ORDER BY
+          substr("Report Submission Date", 7, 4) || "-" ||
+          substr("Report Submission Date", 1, 2) || "-" ||
+          substr("Report Submission Date", 4, 2) || " " ||
+          printf("%02d",
+            (CAST(substr("Report Submission Date", 12, 2) AS INTEGER) % 12) +
+            CASE
+              WHEN substr("Report Submission Date", -2) = "PM"
+              THEN 12
+              ELSE 0
+            END
+          ) ||
+          substr("Report Submission Date", 14, 6) DESC
+      ) AS submission_rank
+    FROM buildings
+  )
+  SELECT *
+  FROM ranked
+  WHERE submission_rank = 1;
+')
+```
+
+**Method note:** The ranking is based on the latest reported submission timestamp. Where dates are missing or tied, the selected row may depend on the available ordering information. The cleaned table is appropriate for this exploratory analysis, but these cases are a limitation.
+
+The resulting cleaned table contains **102,484 records**, 775 fewer than the original.
+
+```{r}
+#| label: analysis-28
+#| echo: false
+# Count rows remaining after deduplication.
+dbGetQuery(con, '
+  SELECT COUNT(*) AS cleaned_records
+  FROM buildings_clean;
+')
+```
+
+The cleaned table contains 102,484 records, 775 fewer than the original.
+
+A final check tests whether any repeated property-year groups remain.
+
+```{r}
+#| label: analysis-29
+#| echo: false
+# Verify property-year uniqueness in the cleaned table.
+dbGetQuery(con, '
+  SELECT 
+    "Property ID",
+    "Calendar Year",
+     COUNT(*) AS record_count
+  FROM buildings_clean
+  GROUP BY "Property ID", "Calendar Year"
+  HAVING COUNT(*) > 1;
+')
+```
+
+No repeated property-year groups remain after deduplication.
+
+## Missing and invalid Site EUI values
+
+Before statistical analysis, I checked whether Site EUI was absent, blank, nonnumeric, or negative. These cases are not interchangeable in SQLite.
+
+```{r}
+#| label: analysis-30
+#| include: false
+# Count SQL NULL values for Site EUI.
+dbGetQuery(con, '
+  SELECT 
+    "Calendar Year",
+    COUNT(*) AS total_records,
+    COUNT("Site EUI (kBtu/ft²)") AS records_with_eui
+  FROM buildings_clean
+  GROUP BY "Calendar Year"
+  ORDER BY "Calendar Year";
+  ')
+```
+
+The initial SQL check showed no NULL values in the Site EUI field, so I investigated other missing-value representations.
+
+The next query checks for blank strings and missing-value labels.
+
+```{r}
+#| label: analysis-31
+#| include: false
+# Check empty or missing-like Site EUI strings.
+dbGetQuery(con, '
+  SELECT
+    "Calendar Year",
+    COUNT(*) AS total_records,
+    SUM(
+      CASE
+        WHEN TRIM("Site EUI (kBtu/ft²)") = ""
+        THEN 1
+        ELSE 0
+      END
+    ) AS blank_eui
+  FROM buildings_clean
+  GROUP BY "Calendar Year"
+  ORDER BY "Calendar Year";
+')
+```
+
+The Site EUI field contains no SQL NULL values or empty strings in the cleaned table.
+
+The next check looks for nonnumeric Site EUI entries.
+
+An explicit `Not Available` string must be excluded before numerical calculations. In SQLite, casting a nonnumeric string to `REAL` can produce zero rather than a missing value.
+
+```{r}
+#| label: analysis-32
+#| include: false
+# Inspect unexpected nonnumeric EUI values.
+dbGetQuery(con, '
+  SELECT DISTINCT
+    "Site EUI (kBtu/ft²)" AS site_eui
+  FROM buildings_clean
+  WHERE "Site EUI (kBtu/ft²)" GLOB "*[^0-9.]*"
+  LIMIT 20;
+')
+# *[^0-9.]* looks for values containing at least one character that isisnt a digit (0-9) or a decimal point
+```
+
+Negative Site EUI values are not physically meaningful in this context, while `Not Available` indicates an unavailable measurement.
+
+I checked how these invalid or unavailable values were distributed across reporting years.
+
+The largest count of unavailable Site EUI records occurred in 2024. These values are retained in the cleaned database but excluded from valid-EUI calculations.
+
+```{r}
+#| label: analysis-33
+#| echo: false
+# Count unavailable and negative EUI records by year.
+dbGetQuery(con, '
+  SELECT
+    "Calendar Year",
+    COUNT(*) AS total_records,
+
+    SUM(
+      CASE
+        WHEN "Site EUI (kBtu/ft²)" = "Not Available"
+        THEN 1
+        ELSE 0
+      END
+    ) AS unavailable_eui,
+
+    SUM(
+      CASE
+        WHEN CAST("Site EUI (kBtu/ft²)" AS REAL) < 0
+        THEN 1
+        ELSE 0
+      END
+    ) AS negative_eui
+
+  FROM buildings_clean
+  GROUP BY "Calendar Year"
+  ORDER BY "Calendar Year";
+')
+```
+
+Unavailable EUI values appear in each year, with the highest count in 2024.
+
+Filtering out unavailable and negative EUI leaves 28,761 valid observations in 2022, 30,333 in 2023, and 30,575 in 2024.
+
+```{r}
+#| label: analysis-34
+#| echo: false
+# Count observations with valid, nonnegative EUI.
+dbGetQuery(con, '
+  SELECT
+    "Calendar Year",
+    COUNT(*) AS valid_eui_records
+  FROM buildings_clean
+  WHERE "Site EUI (kBtu/ft²)" != "Not Available"
+    AND CAST("Site EUI (kBtu/ft²)" AS REAL) >= 0
+  GROUP BY "Calendar Year"
+  ORDER BY "Calendar Year";
+')
+```
+
+Unavailable and negative values are excluded from numeric EUI summaries, but retained in the cleaned database for auditing.
+
+With a defined valid-EUI subset, the analysis turns to differences across years.
+
+## Annual energy-intensity analysis
+
+Annual means are highly sensitive to extreme values, so the next steps examine the distribution before drawing conclusions.
+
+```{r}
+#| label: analysis-35
+#| echo: false
+# Calculate annual mean EUI for initial comparison.
+dbGetQuery(con, '
+  SELECT
+    "Calendar Year",
+    ROUND(AVG(CAST("Site EUI (kBtu/ft²)" AS REAL)), 2) AS avg_site_eui
+  FROM buildings_clean
+  WHERE "Site EUI (kBtu/ft²)" != "Not Available"
+    AND CAST("Site EUI (kBtu/ft²)" AS REAL) >= 0
+  GROUP BY "Calendar Year"
+  ORDER BY "Calendar Year";
+')
+```
+
+The 2023 mean of 15,018.12 kBtu/ft² is unusually high, suggesting strong influence from extreme observations.
+
+I examined the largest reported Site EUI values to understand the skew.
+
+This query sorts valid Site EUI numerically rather than alphabetically. The most extreme values are far above typical building energy intensities and warrant caution.
+
+```{r}
+#| label: analysis-36
+#| echo: false
+# Inspect the largest numeric EUI observations.
+dbGetQuery(con, '
+  SELECT
+    "Calendar Year",
+    "Property ID",
+    "Primary Property Type - Self Selected" AS property_type,
+    "Site EUI (kBtu/ft²)" AS site_eui
+  FROM buildings_clean
+  WHERE "Site EUI (kBtu/ft²)" != "Not Available"
+    AND CAST("Site EUI (kBtu/ft²)" AS REAL) >= 0
+  ORDER BY CAST("Site EUI (kBtu/ft²)" AS REAL) DESC
+  LIMIT 10;
+')
+```
+
+Some reported Site EUI values reach into the millions of kBtu/ft².
+
+These extremely high intensities could reflect reporting or unit issues, although the data alone do not establish the cause.
+
+I checked whether the extreme observations were concentrated in particular property types.
+
+```{r}
+#| label: analysis-37
+#| include: false
+# Count records by property type.
+dbGetQuery(con, '
+  SELECT
+    "Primary Property Type - Self Selected" AS property_type,
+    COUNT(*) AS total_records
+  FROM buildings_clean
+  GROUP BY "Primary Property Type - Self Selected"
+  ORDER BY total_records DESC
+  LIMIT 15;
+')
+```
+
+```{r}
+#| label: analysis-38
+#| echo: false
+# Inspect the property with the largest EUI.
+dbGetQuery(con, '
+  SELECT
+    "Property ID",
+    "Property Name",
+    "Primary Property Type - Self Selected" AS property_type,
+    "Site EUI (kBtu/ft²)" AS site_eui
+  FROM buildings_clean
+  WHERE "Property ID" = 4038924
+    AND "Calendar Year" = 2023;
+')
+```
+
+The most extreme observation was classified as multifamily housing, where a value this high must be investigated. This does explain however why the averages were so high. It can be seen a small number of extreme values can drastically increase the mean.
+
+I compared annual means and medians to assess sensitivity to extreme values.
+
+For annual comparisons, medians provide a more robust summary than means when the dataset contains extreme high values.
+
+```{r}
+#| label: analysis-39
+#| echo: false
+# Calculate annual median EUI.
+eui_values <- dbGetQuery(con, '
+  SELECT
+      "Calendar Year" AS year,
+      "Site EUI (kBtu/ft²)" AS site_eui
+    FROM buildings_clean
+    WHERE "Site EUI (kBtu/ft²)" != "Not Available"
+      AND CAST("Site EUI (kBtu/ft²)" AS REAL) >= 0;
+      ')
+# AND CST() takes site EUI values and converst it into a number that can contain decimals.
+eui_values$site_eui <- as.numeric(eui_values$site_eui)
+aggregate(site_eui ~ year, data = eui_values, FUN = median)
+# aggregate(site_eui ~ year) groupes site EUI values by calander year
+```
+
+The medians were far lower than the means, consistent with a small number of unusually high observations skewing the mean upward. In order to decide what to do with the extreme values I will first try an understand their distribution.
+
+The next calculation examines the upper end of the EUI distribution.
+
+The 50th, 90th, and 99th percentiles describe the center and upper tail of the distribution.
+
+```{r}
+#| label: analysis-40
+#| echo: false
+# Calculate median, 90th, and 99th percentiles.
+percentiles <- aggregate(
+  site_eui ~ year,
+  data = eui_values,
+  FUN = function(x) quantile(x, probs = c(0.50, 0.90, 0.99))
+)
+print(percentiles)
+```
+
+The percentile plot helps show why the median is more informative than the mean for this dataset.
+
+```{r}
+#| label: analysis-41
+#| echo: false
+# Reshape the percentile output and plot it.
+library(ggplot2)
+library(tidyr)
+percentiles <- data.frame(
+  year = percentiles$year,
+  percentiles$site_eui
+)
+
+percentiles_long <- pivot_longer(
+  percentiles,
+  cols = -year,
+  names_to = "percentile",
+  values_to = "site_eui"
+)
+
+ggplot(percentiles_long,
+       aes(x = year, y = site_eui, color = percentile)) +
+  geom_line() +
+  geom_point() +
+  labs(
+    title = "NYC Building Site EUI Percentiles (2022–2024)",
+    x = "Calendar Year",
+    y = "Site EUI (kBtu/ft²)",
+    color = "Percentile"
+  ) +
+  theme_minimal()
+```
+
+**Interpretation:** Extreme high EUI observations substantially affect the annual means. Medians and upper percentiles are therefore presented alongside the mean rather than discarding unusual values without verification.
+
+The upper-tail results support retaining the flagged records for review while using medians for the main descriptive comparisons.
+
+I used 1,000 kBtu/ft² as an exploratory threshold to count unusually high reports.
+
+## Extreme values and property-type comparisons
+
+The threshold of 1,000 kBtu/ft² is an **exploratory flag**, not an official error cutoff. Flagged values are not automatically removed.
+
+```{r}
+#| label: analysis-42
+#| include: false
+# Count values above the exploratory threshold.
+dbGetQuery(con, '
+  SELECT
+    "Calendar Year" AS year,
+    COUNT(*) AS extreme_records
+  FROM buildings_clean
+  WHERE CAST("Site EUI (kBtu/ft²)" AS REAL) > 1000
+  GROUP BY "Calendar Year"
+  ORDER BY year;
+')
+```
+
+The next calculation expresses these counts as percentages of records.
+
+```{r}
+#| label: analysis-43
+#| echo: false
+# Calculate annual percentages above the threshold.
+extreme_eui <- dbGetQuery(con, '
+  SELECT
+    "Calendar Year" AS year,
+    COUNT(*) AS total_records,
+    SUM(
+      CASE
+        WHEN CAST("Site EUI (kBtu/ft²)" AS REAL) > 1000
+        THEN 1
+        ELSE 0
+      END
+    ) AS extreme_records
+  FROM buildings_clean
+  GROUP BY "Calendar Year"
+  ORDER BY year;
+')
+
+extreme_eui$percentage <- round(
+  extreme_eui$extreme_records / extreme_eui$total_records * 100,
+  2
+)
+
+print(extreme_eui)
+```
+
+Less than 1% of records in each year exceeded the exploratory threshold; 2023 had the highest share at approximately 0.55%.
+
+```{r}
+#| label: analysis-44
+#| echo: false
+# Plot annual shares of extreme observations.
+library(ggplot2)
+
+ggplot(extreme_eui,
+       aes(x = factor(year), y = percentage)) +
+  geom_col(fill = "steelblue") +
+  geom_text(
+    aes(label = paste0(percentage, "%")),
+    vjust = -0.5
+  ) +
+  labs(
+    title = "Extreme Site EUI Values in NYC Buildings",
+    subtitle = "Percentage of records with Site EUI above 1,000 kBtu/ft²",
+    x = "Calendar Year",
+    y = "Percentage of Records"
+  ) +
+  scale_y_continuous(
+    limits = c(0, 0.7),
+    breaks = seq(0, 0.7, 0.1),
+    labels = function(x) paste0(x, "%")
+  ) +
+  theme_minimal()
+```
+
+Fewer than 1% of records exceeded 1,000 kBtu/ft² in each year; the largest share was in 2023 (about 0.55%), compared with 0.22% in 2022 and 0.41% in 2024. Although these observations were uncommon, their unusually high values substantially influenced the annual mean Site EUI. These records were retained in the cleaned dataset for further investigation, while median values were used to describe typical energy performance.
+
+I next compared flagged observations across property types.
+
+```{r}
+#| label: analysis-45
+#| include: false
+# Count flagged values by property type.
+dbGetQuery(con, '
+  SELECT
+    "Primary Property Type - Self Selected" AS property_type,
+    COUNT(*) AS extreme_records
+  FROM buildings_clean
+  WHERE CAST("Site EUI (kBtu/ft²)" AS REAL) > 1000
+  GROUP BY "Primary Property Type - Self Selected"
+  ORDER BY extreme_records DESC
+  LIMIT 10;
+')
+```
+
+Multifamily housing accounted for approximately 53.4% of the 410 flagged observations, but it also represents a large share of the data set. (68,103). That means having the highest number of extreme records doesn’t necessarily mean multifamily buildings are the most likely to report extreme EUI.
+
+I therefore calculated flagged-record rates within each category.
+
+Raw counts of extreme observations can be misleading when categories differ greatly in size. The within-category percentage offers a fairer comparison.
+
+```{r}
+#| label: analysis-46
+#| echo: false
+# Calculate within-type rates of flagged values.
+dbGetQuery(con, '
+  SELECT
+    "Primary Property Type - Self Selected" AS property_type,
+    COUNT(*) AS total_records,
+
+    SUM(
+      CASE
+        WHEN CAST("Site EUI (kBtu/ft²)" AS REAL) > 1000
+        THEN 1
+        ELSE 0
+      END
+    ) AS extreme_records,
+
+    ROUND(
+      100.0 * SUM(
+        CASE
+          WHEN CAST("Site EUI (kBtu/ft²)" AS REAL) > 1000
+          THEN 1
+          ELSE 0
+        END
+      ) / COUNT(*),
+      2
+    ) AS percentage_extreme
+
+  FROM buildings_clean
+  GROUP BY "Primary Property Type - Self Selected"
+  ORDER BY extreme_records DESC
+  LIMIT 10;
+')
+```
+
+Laboratories had a relatively high proportion of flagged observations. Their energy-intensive operations may help explain some high values.
+
+I calculated annual median EUI for each self-selected property type.
+
+Building types are identified using the self-selected primary property-type field. The analysis computes a separate median for each type and calendar year.
+
+```{r}
+#| label: analysis-47
+#| include: false
+# Calculate annual medians by property type.
+property_eui <- dbGetQuery(con, '
+  SELECT
+    "Calendar Year" AS year,
+    "Primary Property Type - Self Selected" AS property_type,
+    "Site EUI (kBtu/ft²)" AS site_eui
+  FROM buildings_clean
+  WHERE "Site EUI (kBtu/ft²)" != \'Not Available\'
+    AND CAST("Site EUI (kBtu/ft²)" AS REAL) >= 0;
+')
+
+property_eui$site_eui <- as.numeric(property_eui$site_eui)
+
+median_by_type <- aggregate(
+  site_eui ~ year + property_type,
+  data = property_eui,
+  FUN = median
+)
+
+head(median_by_type, 10)
+```
+
+For a readable comparison, I selected five major property categories.
+
+
+```{r}
+#| label: analysis-48
+#| echo: false
+# Select five types for comparison.
+major_types <- c(
+  "Multifamily Housing",
+  "Office",
+  "K-12 School",
+  "Hotel",
+  "College/University"
+)
+
+major_eui <- median_by_type[
+  median_by_type$property_type %in% major_types,
+]
+
+print(major_eui)
+```
+
+```{r}
+#| label: analysis-49
+#| echo: false
+# Plot annual property-type medians.
+library(ggplot2)
+
+ggplot(major_eui,
+       aes(x = year, y = site_eui, color = property_type)) +
+  geom_line() +
+  geom_point() +
+  labs(
+    title = "Median Site EUI by NYC Property Type",
+    subtitle = "2022–2024",
+    x = "Calendar Year",
+    y = "Median Site EUI (kBtu/ft²)",
+    color = "Property Type"
+  ) +
+  scale_x_continuous(breaks = 2022:2024) +
+  theme_minimal()
+```
+
+Sample sizes were added because medians based on fewer observations require more caution.
+
+The next chunk calculates the number of valid records per category and year.
+
+The number of valid observations contributing to each median is calculated so readers can judge how much data supports each comparison.
+
+```{r}
+#| label: analysis-50
+#| include: false
+# Count records and attach sample sizes to medians.
+library(dplyr)
+
+property_counts <- property_eui %>%
+  group_by(year, property_type) %>%
+  summarise(
+    n = n(),
+    .groups = "drop"
+  )
+
+head(property_counts, 10)
+median_by_type <- aggregate(
+  site_eui ~ year + property_type,
+  data = property_eui,
+  FUN = median
+)
+
+median_by_type <- left_join(
+  median_by_type,
+  property_counts,
+  by = c("year", "property_type")
+)
+
+median_by_type <- median_by_type %>%
+  select(year, property_type, site_eui, n)
+head(median_by_type, 10)
+```
+
+```{r}
+#| label: analysis-51
+#| include: false
+# Refresh the five-category subset with sample sizes.
+major_eui <- median_by_type %>%
+  filter(property_type %in% c(
+    "Multifamily Housing",
+    "Office",
+    "K-12 School",
+    "Hotel",
+    "College/University"
+  ))
+
+print(major_eui)
+```
+
+In the bubble-line chart, each point is an annual median and bubble area represents the number of valid observations.
+
+```{r}
+#| label: analysis-52
+#| echo: false
+# Plot annual medians with bubble sizes for sample counts.
+library(ggplot2)
+
+ggplot(major_eui,
+       aes(x = year,
+           y = site_eui,
+           color = property_type,
+           size = n,
+           group = property_type)) +
+  geom_line(linewidth = 0.7, alpha = 0.5) +
+  geom_point(alpha = 0.7) +
+  scale_size_area(max_size = 14) +
+  scale_x_continuous(breaks = 2022:2024) +
+  labs(
+    title = "Median Site EUI by NYC Property Type",
+    subtitle = "Bubble size represents number of valid records",
+    x = "Calendar Year",
+    y = "Median Site EUI (kBtu/ft²)",
+    color = "Property Type",
+    size = "Number of Records"
+  ) +
+  theme_minimal()
+```
+
+The matched-building analysis begins by identifying properties with valid reports in all three years.
+
+## Matched-building analysis, 2022–2024
+
+Annual property-type medians may describe different sets of buildings. A matched-building analysis instead follows the same property IDs across all three years.
+
+```{r}
+#| label: analysis-53
+#| echo: false
+# Count properties with valid EUI in all three years.
+dbGetQuery(con, '
+  SELECT
+    COUNT(*) AS buildings_with_valid_eui
+  FROM (
+    SELECT
+      "Property ID"
+    FROM buildings_clean
+    WHERE "Property ID" IS NOT NULL
+      AND "Site EUI (kBtu/ft²)" != \'Not Available\'
+      AND CAST("Site EUI (kBtu/ft²)" AS REAL) >= 0
+    GROUP BY "Property ID"
+    HAVING COUNT(DISTINCT "Calendar Year") = 3
+  );
+')
+```
+
+`pivot_wider()` places each property’s annual EUI into separate columns; `drop_na()` retains only properties with valid EUI in 2022, 2023, and 2024. This produces **21,708 matched properties**.
+
+```{r}
+#| label: analysis-54
+#| echo: false
+# Reshape valid EUI into one row per property.
+library(tidyr)
+library(dplyr)
+
+matched_eui <- dbGetQuery(con, '
+  SELECT
+    "Property ID" AS property_id,
+    "Calendar Year" AS year,
+    "Site EUI (kBtu/ft²)" AS site_eui
+  FROM buildings_clean
+  WHERE "Property ID" IS NOT NULL
+    AND "Site EUI (kBtu/ft²)" != \'Not Available\'
+    AND CAST("Site EUI (kBtu/ft²)" AS REAL) >= 0;
+')
+
+matched_eui$site_eui <- as.numeric(matched_eui$site_eui)
+
+matched_eui <- matched_eui %>%
+  pivot_wider(
+    names_from = year,
+    values_from = site_eui
+  ) %>%
+  drop_na(`2022`, `2023`, `2024`)
+
+nrow(matched_eui)
+head(matched_eui, 10)
+```
+
+For each matched property, I calculated absolute and percentage changes between 2022 and 2024.
+
+Absolute EUI change is 2024 minus 2022. Percentage change uses 2022 as the baseline; `na_if(..., 0)` avoids division by zero.
+
+```{r}
+#| label: analysis-55
+#| include: false
+# Calculate absolute and relative EUI changes.
+matched_eui <- matched_eui %>%
+  mutate(
+    eui_change = `2024` - `2022`,
+    percent_change = (`2024` - `2022`) /
+      na_if(`2022`, 0) * 100
+  )
+
+# na_if prevents division by zero
+head(matched_eui, 10)
+```
+
+Among 21,708 matched buildings, **14,621 decreased**, **6,975 increased**, and **112 were unchanged**. The median building-level change was **−4.1 kBtu/ft²**, and the median percentage change was approximately **−5.99%**.
+
+```{r}
+#| label: analysis-56
+#| echo: false
+# Summarize building-level increases and decreases.
+matched_eui %>%
+  summarise(
+    total_buildings = n(),
+    decreased = sum(eui_change < 0),
+    increased = sum(eui_change > 0),
+    unchanged = sum(eui_change == 0),
+    median_change = median(eui_change),
+    median_percent_change = median(percent_change, na.rm = TRUE)
+  )
+```
+
+Most matched properties reported lower Site EUI in 2024 than in 2022.
+
+```{r}
+#| label: analysis-57
+#| echo: false
+# Plot the share of matched buildings with EUI changes.
+library(dplyr)
+library(ggplot2)
+
+change_summary <- matched_eui %>%
+  summarise(
+    Decreased = sum(eui_change < 0),
+    Increased = sum(eui_change > 0),
+    Unchanged = sum(eui_change == 0)
+  ) %>%
+  tidyr::pivot_longer(
+    cols = everything(),
+    names_to = "change",
+    values_to = "buildings"
+  ) %>%
+  mutate(
+    percentage = buildings / sum(buildings) * 100
+  )
+
+ggplot(change_summary,
+       aes(x = change, y = percentage)) +
+  geom_col(fill = "steelblue") +
+  geom_text(
+    aes(label = paste0(round(percentage, 1), "%")),
+    vjust = -0.5
+  ) +
+  labs(
+    title = "Changes in Site EUI Among Matched NYC Buildings",
+    subtitle = "21,708 buildings with valid data in 2022, 2023, and 2024",
+    x = "Change from 2022 to 2024",
+    y = "Percentage of Buildings"
+  ) +
+  scale_y_continuous(limits = c(0, 75)) +
+  theme_minimal()
+```
+
+**Interpretation:** About 67.4% of matched properties reported lower EUI in 2024 than in 2022; about 32.1% reported higher EUI. The median building-level percentage change was approximately −6%. This is a descriptive finding, not evidence of a particular intervention.
+
+I compared matched-building changes across property types to identify differences in their reported trends.2 and 2024, when comparing the same buildings?
+
+## Differences across building types
+
+Each matched building is assigned its **2022 self-selected property type** for a consistent baseline classification. A property’s actual use may have changed later.
+
+```{r}
+#| label: analysis-58
+#| include: false
+# Join baseline property classifications to matched buildings.
+property_types <- dbGetQuery(con, '
+  SELECT
+    "Property ID" AS property_id,
+    "Primary Property Type - Self Selected" AS property_type
+  FROM buildings_clean
+  WHERE "Calendar Year" = 2022;
+')
+
+matched_eui <- matched_eui %>%
+  select(-starts_with("property_type")) %>%
+  left_join(property_types, by = "property_id")
+head(matched_eui)
+nrow(matched_eui)
+```
+
+Only categories with at least 100 matched buildings are plotted. This is a descriptive sample-size threshold, not a statistical significance test.
+
+```{r}
+#| label: analysis-59
+#| echo: false
+# Summarize matched changes by property type.
+change_by_type <- matched_eui %>%
+  group_by(property_type) %>%
+  summarise(
+    buildings = n(),
+    median_percent_change = median(percent_change, na.rm = TRUE),
+    percent_decreased = mean(eui_change < 0) * 100,
+    .groups = "drop"
+  ) %>%
+  filter(buildings >= 100) %>%
+  arrange(median_percent_change)
+
+change_by_type
+```
+
+K-12 schools show the largest median percentage decline among the plotted categories, while hotels and parking facilities appear on the positive side. These are changes in **reported Site EUI**, not proven changes in technical efficiency.
+
+```{r}
+#| label: analysis-60
+#| echo: false
+# Plot median percentage change by property type.
+ggplot(change_by_type,
+       aes(x = reorder(property_type, median_percent_change),
+           y = median_percent_change)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "Site EUI Change by Building Type",
+    subtitle = "Same NYC buildings, 2022–2024 (n ≥ 100 per type)",
+    x = NULL,
+    y = "Median Change in Site EUI (%)"
+  ) +
+  theme_minimal()
+```
+
+Among 1,547 matched K-12 schools, the annual median Site EUI was **72.0 in 2022**, **60.4 in 2023**, and **60.5 in 2024**.
+
+```{r}
+#| label: analysis-61
+#| echo: false
+# Compare annual median EUI among matched schools.
+school_eui <- matched_eui %>%
+  filter(property_type == "K-12 School") %>%
+  summarise(
+    median_2022 = median(`2022`),
+    median_2023 = median(`2023`),
+    median_2024 = median(`2024`)
+  )
+
+school_eui
+```
+
+The median Site EUI for matched schools fell sharply in 2022–2023 and remained almost unchanged in 2023–2024.
+
+Calculating each school’s year-to-year percentage change first gives median changes of approximately **−15.70% (2022–2023)** and **−0.11% (2023–2024)**.
+
+```{r}
+#| label: analysis-62
+#| echo: false
+# Compare year-to-year changes within matched schools.
+matched_eui %>%
+  filter(property_type == "K-12 School") %>%
+  summarise(
+    change_2022_2023 = median(
+      (`2023` - `2022`) / na_if(`2022`, 0) * 100,
+      na.rm = TRUE
+    ),
+    change_2023_2024 = median(
+      (`2024` - `2023`) / na_if(`2023`, 0) * 100,
+      na.rm = TRUE
+    )
+  )
+```
+
+I then checked whether the same timing appeared in other property categories.
+
+Several other property types also show a first-period decline followed by smaller changes or increases in the second period. This suggests the school pattern is part of a broader descriptive trend, although the causes cannot be identified from these data alone.
+
+```{r}
+#| label: analysis-63
+#| echo: false
+# Compare year-to-year changes across building types.
+yearly_changes <- matched_eui %>%
+  group_by(property_type) %>%
+  summarise(
+    buildings = n(),
+    change_22_23 = median(
+      (`2023` - `2022`) / na_if(`2022`, 0) * 100,
+      na.rm = TRUE
+    ),
+    change_23_24 = median(
+      (`2024` - `2023`) / na_if(`2023`, 0) * 100,
+      na.rm = TRUE
+    ),
+    .groups = "drop"
+  ) %>%
+  filter(buildings >= 100) %>%
+  arrange(change_22_23)
+
+yearly_changes
+```
+
+**Interpretation:** The pronounced 2022–2023 decrease was not limited to schools. A possible explanation is changing occupancy or operations following the COVID-19 pandemic, but the available data do not establish a cause. Weather, reporting practices, and building operations could also contribute.
+
+Several property types show a large median decline in 2022–2023 followed by smaller changes in 2023–2024.
+
+The widespread decrease in Site EUI between 2022 and 2023 may partly reflect changes in building occupancy and operations following the COVID-19 pandemic. However, differences in weather conditions, energy use, and reporting practices may also have contributed. Further analysis would be needed to determine what drove these changes.
+
+# Discussion and limitations
+
+The investigation identified several data-quality concerns that matter for energy benchmarking. Repeated property year submissions required a consistent selection rule, `Not Available` values could not be treated as valid zero measurements, and a small number of exceptionally high EUI records strongly influenced means. These findings support using descriptive statistics and documenting exclusions.
+
+Across the matched sample, a majority of buildings reported lower Site EUI in 2024 than in 2022. The results also varied by property type: matched K-12 schools had a relatively large median decline, concentrated in 2022–2023, while the property-type comparison identified hotels and parking facilities as categories worth examining for positive median changes.
+
+The analysis has important limitations. Site EUI does not account for weather in these calculations, building occupancy and operating hours were not controlled for, and self-reported property classifications may change. Changes in EUI should not be attributed solely to efficiency improvements or pandemic related occupancy without additional evidence.
+
+## Potential energy-efficiency follow-up
+
+The positive median EUI changes observed for hotels and parking facilities suggest two possible areas for further investigation. For **hotels**, useful follow-up questions include whether HVAC controls reflect guest-room occupancy and whether heating, cooling, and ventilation schedules are appropriate. For **parking facilities**, lighting schedules and demand-controlled ventilation could be examined. These are **potential measures to evaluate**, not verified explanations or recommendations for particular properties.
+
+# Conclusion
+
+This project demonstrates how data validation affects the reliability of environmental performance comparisons. Starting with 103,259 raw records, the workflow created a cleaned dataset of 102,484 property-year records and identified 21,708 properties with valid Site EUI in all three years. The matched analysis found a median building-level Site EUI change of approximately −5.99% from 2022 to 2024, with substantial variation across property types.
+
+The main takeaway is that building energy benchmarking data can identify patterns and potential priorities for investigation, but careful treatment of duplicate submissions, missing values, and outliers is necessary before interpreting those patterns. 
+
+
